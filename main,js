@@ -1,0 +1,166 @@
+
+
+const express = require('express');
+const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
+const qrcode = require('qrcode-terminal');
+const fs = require('fs');
+const path = require('path');
+const winston = require('winston');
+const multer = require('multer'); // Para manejar la subida de archivos
+const mime = require('mime-types'); // You might need to install this: npm install mime-types
+
+// Configuración del logger
+const logger = winston.createLogger({
+    level: 'info',
+    format: winston.format.combine(
+        winston.format.timestamp(),
+        winston.format.printf(({ timestamp, level, message }) => {
+            return `[${timestamp}] ${level.toUpperCase()}: ${message}`;
+        })
+    ),
+    transports: [
+        new winston.transports.Console(),
+        new winston.transports.File({ filename: 'logs/app.log' })
+    ]
+});
+
+const app = express();
+const port = 8082;
+
+// Configuración de multer para manejar la subida de archivos
+const upload = multer({ dest: 'uploads/' }); // Archivos se guardan en la carpeta "uploads"
+
+// Middleware para parsear el cuerpo de las peticiones en formato JSON
+app.use(express.json());
+
+// Verificar existencia de directorios de autenticación y caché
+const authPath = path.join(__dirname, 'auth');
+const cachePath = path.join(__dirname, '.wwebjs_cache');
+const sessionExists = fs.existsSync(authPath) && fs.existsSync(cachePath);
+
+// Configurar cliente de WhatsApp
+const client = new Client({
+    authStrategy: new LocalAuth(),
+    // puppeteer: {
+    //     executablePath: '/usr/bin/chromium-browser',
+    //     args: ['--no-sandbox', '--disable-setuid-sandbox']
+    // }
+});
+
+// Mostrar QR solo si no existe sesión guardada
+if (!sessionExists) {
+    client.on('qr', (qr) => {
+        qrcode.generate(qr, { small: true });
+        logger.info('Código QR generado. Escanea el código para autenticarte.');
+    });
+}
+
+// Cuando el cliente esté listo
+client.on('ready', () => {
+    logger.info('Cliente de WhatsApp conectado!');
+    
+    // Iniciar servidor solo cuando WhatsApp esté conectado
+    app.listen(port, () => {
+        logger.info(`Servidor escuchando en http://localhost:${port}`);
+    });
+});
+
+// Manejo de errores del cliente
+client.on('auth_failure', (msg) => {
+    logger.error('Error de autenticación: ' + msg);
+});
+
+client.on('disconnected', (reason) => {
+    logger.warn('Cliente de WhatsApp desconectado: ' + reason);
+});
+
+// Endpoint para enviar mensajes (texto o multimedia)
+// Add this at the top of your file
+
+
+// Modify your endpoint to better handle video files
+app.post('/enviar-mensaje', upload.single('archivo'), async (req, res) => {
+    const { numero, mensaje } = req.body;
+    const archivo = req.file;
+
+    if (!numero) {
+        return res.status(400).json({ error: 'Falta el número.' });
+    }
+
+    try {
+        const numberId = await client.getNumberId(numero);
+        if (!numberId) {
+            return res.status(400).json({ error: 'El número no está registrado en WhatsApp.' });
+        }
+
+        const chatId = numberId._serialized;
+
+        if (archivo) {
+            logger.info(`Received file: ${archivo.originalname || archivo.filename}, size: ${archivo.size}, mimetype: ${archivo.mimetype}`);
+            
+            // Check if file is too large
+            if (archivo.size > 15 * 1024 * 1024) { // 15MB limit
+                return res.status(400).json({ error: 'El archivo es demasiado grande. WhatsApp tiene un límite de 16MB.' });
+            }
+            
+            try {
+                // Create media with proper mimetype detection
+                const fileMimeType = archivo.mimetype || mime.lookup(archivo.path) || 'application/octet-stream';
+                const fileName = archivo.originalname || `file_${Date.now()}${mime.extension(fileMimeType)}`;
+                
+                // Read as base64
+                const fileData = fs.readFileSync(archivo.path, {encoding: 'base64'});
+                
+                // Create a new MessageMedia object
+                const media = new MessageMedia(fileMimeType, fileData, fileName);
+                
+                // Different options based on file type
+                let options = { caption: mensaje || '' };
+                
+                // Specific options for documents vs media
+                if (fileMimeType.startsWith('video/') || fileMimeType.startsWith('audio/')) {
+                    options.sendMediaAsDocument = false; // Send videos/audio as media
+                } else if (fileMimeType === 'application/pdf' || !fileMimeType.startsWith('image/')) {
+                    options.sendMediaAsDocument = true; // Send PDFs and other files as documents
+                }
+                
+                logger.info(`Sending file as ${options.sendMediaAsDocument ? 'document' : 'media'}`);
+                
+                // Send the message with proper options
+                await client.sendMessage(chatId, media, options);
+                
+                // Clean up
+                fs.unlinkSync(archivo.path);
+                
+                return res.json({ 
+                    success: true, 
+                    message: `Archivo enviado con éxito como ${options.sendMediaAsDocument ? 'documento' : 'multimedia'}.` 
+                });
+            } catch (err) {
+                logger.error(`Error sending media: ${err.message}`);
+                throw err;
+            }
+        } else if (mensaje) {
+            await client.sendMessage(chatId, mensaje);
+            return res.json({ success: true, message: 'Mensaje de texto enviado con éxito.' });
+        } else {
+            return res.status(400).json({ error: 'Se requiere un mensaje o un archivo.' });
+        }
+    } catch (err) {
+        logger.error(`Error al enviar el mensaje: ${err.message}`);
+        logger.error(err.stack);
+        res.status(500).json({ error: `Error al enviar el mensaje: ${err.message}` });
+    }
+});
+// Inicializar el cliente de WhatsApp
+client.initialize();
+
+// Crear directorio de logs si no existe
+if (!fs.existsSync('logs')) {
+    fs.mkdirSync('logs');
+}
+
+// Crear directorio de uploads si no existe
+if (!fs.existsSync('uploads')) {
+    fs.mkdirSync('uploads');
+}
